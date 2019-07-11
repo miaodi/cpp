@@ -6,128 +6,253 @@
 #include <vector>
 #include <eigen3/Eigen/Dense>
 #include <map>
+#include <functional>
+#include <type_traits>
 
 using namespace Eigen;
 using namespace std;
 
-double funnyThing(int a, const double &b)
+namespace std
 {
-  return 3.141 * a * b;
-}
+template <>
+struct less<Vector3d>
+{
+  bool operator()(const Vector3d &a, const Vector3d &b) const
+  {
+    assert(a.size() == b.size());
+    for (size_t i = 0; i < a.size(); ++i)
+    {
+      if (a(i) < b(i))
+        return true;
+      if (a(i) > b(i))
+        return false;
+    }
+    return false;
+  }
+};
 
-// template <typename Callable, typename F>
-// class MemoizeG;
+template <>
+struct less<std::tuple<Vector3d>>
+{
+  bool operator()(const std::tuple<Vector3d> &aa, const std::tuple<Vector3d> &bb) const
+  {
+    Vector3d a = get<0>(aa);
+    Vector3d b = get<0>(bb);
+    assert(a.size() == b.size());
+    for (size_t i = 0; i < a.size(); ++i)
+    {
+      if (a(i) < b(i))
+        return true;
+      if (a(i) > b(i))
+        return false;
+    }
+    return false;
+  }
+};
+} // namespace std
 
-// template <typename ReturnType, typename... ArgTypes, typename F>
-// class MemoizeG<ReturnType(ArgTypes...), F>
-// {
-// public:
-//   MemoizeG(F &&f) : _f(std::forward<F>(f)) {}
-//   ReturnType operator()(ArgTypes... args)
-//   {
-//     const auto argsAsTuple = std::make_tuple(args...);
-//     auto it = _m.find(argsAsTuple);
-//     if (it == _m.end())
-//     {
-//       const auto &&res = _f(args...);
-//       _m.emplace(argsAsTuple, res);
-//       std::cout << "computed: ...->" << std::endl;
-//       return res;
-//     }
-//     else
-//     {
-//       std::cout << "memoized: ...->" << std::endl;
-//       return it->second;
-//     }
-//   }
+namespace memo
+{
 
-// private:
-//   F _f;
-//   mutable std::map<std::tuple<ArgTypes...>, ReturnType> _m;
-// };
+namespace detail
+{
+// This gets the base function type from pretty much anything it can:
+// C function types, member function types, monomorphic function objects.
+template <typename T, typename Enable = void>
+struct function_signature;
 
-// template <typename ReturnType, typename... ArgTypes, typename F>
-// MemoizeG<ReturnType(ArgTypes...), F> MakeMemoizeG(F &&f)
-// {
-//   return MemoizeG<decltype(f), F>(f);
-// }
-
-struct wrap
+template <typename T>
+struct function_signature<T, typename std::enable_if<
+                                 std::is_class<T>::value>::type> : function_signature<decltype(&T::operator())>
 {
 };
 
-template <class Sig, class F, template <class...> class Hash = std::hash>
-struct memoizer;
-template <class R, class... Args, class F, template <class...> class Hash>
-struct memoizer<R(Args...), F, Hash>
+template <typename T, typename Ret, typename... Args>
+struct function_signature<Ret (T::*)(Args...)>
 {
-  using base_type = F;
+  using type = Ret(Args...);
+};
+
+template <typename T, typename Ret, typename... Args>
+struct function_signature<Ret (T::*)(Args...) const>
+{
+  using type = Ret(Args...);
+};
+
+template <typename Ret, typename... Args>
+struct function_signature<Ret(Args...)>
+{
+  using type = Ret(Args...);
+};
+
+template <typename Ret, typename... Args>
+struct function_signature<Ret (&)(Args...)>
+{
+  using type = Ret(Args...);
+};
+
+template <typename Ret, typename... Args>
+struct function_signature<Ret (*)(Args...)>
+{
+  using type = Ret(Args...);
+};
+
+template <typename T>
+struct remove_const_ref : std::remove_const<
+                              typename std::remove_reference<T>::type>
+{
+};
+
+template <typename T, typename U>
+struct is_same_base_type : std::is_same<
+                               typename remove_const_ref<T>::type,
+                               typename remove_const_ref<U>::type>
+{
+};
+} // namespace detail
+
+template <typename T, typename Function>
+class memoizer;
+
+template <typename T, typename Ret, typename... Args>
+class memoizer<T, Ret(Args...)>
+{
+public:
+  using function_type = Ret(Args...);
+  using tuple_type = std::tuple<typename std::decay_t<Args>...>;
+  using return_type = Ret;
+  using return_reference = const return_type &;
+  // This lets us do lookups in our map without converting our value to
+  // key_type, which saves us a copy. There's a proposal to make this work for
+  // std::unordered_map too.
+  using map_type = std::map<tuple_type, return_type>;
+
+  memoizer() {}
+  memoizer(const T &f) : f_(f) {}
+
+  template <typename... CallArgs>
+  return_reference operator()(CallArgs &&... args)
+  {
+    // This is a roundabout way of requiring that call is called with arguments
+    // of the same basic type as the function (i.e. it will make use of
+    // automatic conversions for similar types). This ensures that we always
+    // call the *same* function for polymorphic function objects.
+    return call<CallArgs...>(std::forward<CallArgs>(args)...);
+  }
 
 private:
-  F base;
-  std::map<std::tuple<std::decay_t<Args>...>, R> cache;
-
-public:
-  template <class... Ts>
-  R operator()(Ts &&... ts) const
+  template <typename T2, typename... Args2>
+  struct can_pass_memoizer
   {
-    auto args = std::make_tuple(ts...);
-    auto it = cache.find(args);
-    if (it != cache.end())
-      return it->second;
+    static const bool value = std::is_invocable_v<T2, memoizer &, Args2...>;
+  };
 
-    auto &&retval = base(*this, std::forward<Ts>(ts)...);
-
-    cache.emplace(std::move(args), retval);
-
-    return decltype(retval)(retval);
-  }
-  template <class... Ts>
-  R operator()(Ts &&... ts)
+  template <typename... CallArgs>
+  return_reference call(CallArgs &&... args)
   {
-    auto args = std::tie(ts...);
-    auto it = cache.find(args);
-    if (it != cache.end())
-      return it->second;
-
-    auto &&retval = base(*this, std::forward<Ts>(ts)...);
-
-    cache.emplace(std::move(args), retval);
-
-    return decltype(retval)(retval);
+    const auto args_tuple = tuple_type(std::forward<CallArgs>(args)...);
+    auto i = memo_.find(args_tuple);
+    if (i != memo_.end())
+    {
+      return i->second;
+    }
+    else
+    {
+      auto result = call_function(std::forward<CallArgs>(args)...);
+      auto ins = memo_.emplace(
+                          std::move(args_tuple),
+                          std::move(result))
+                     .first;
+      return ins->second;
+    }
   }
 
-  memoizer(memoizer const &) = default;
-  memoizer(memoizer &&) = default;
-  memoizer &operator=(memoizer const &) = default;
-  memoizer &operator=(memoizer &&) = default;
-  memoizer() = delete;
-  template <typename L>
-  memoizer(wrap, L &&f) : base(std::forward<L>(f))
+  template <typename... CallArgs>
+  typename std::enable_if_t<
+      can_pass_memoizer<T, CallArgs...>::value,
+      return_type>
+  call_function(CallArgs &&... args)
   {
+    return f_(*this, std::forward<Args>(args)...);
+  }
+
+  template <typename... CallArgs>
+  typename std::enable_if_t<
+      !can_pass_memoizer<T, CallArgs...>::value,
+      return_type>
+  call_function(CallArgs &&... args)
+  {
+    return f_(std::forward<Args>(args)...);
+  }
+
+  map_type memo_;
+  T f_;
+};
+
+template <typename Function, typename T>
+inline auto memoize(T &&t)
+{
+  return memoizer<T, Function>(std::forward<T>(t));
+}
+
+template <typename T>
+inline auto memoize(T &&t)
+{
+  return memoizer<T, typename detail::function_signature<T>::type>(
+      std::forward<T>(t));
+}
+
+} // namespace memo
+
+int func(int a, int b)
+{
+  return a + b;
+}
+
+struct func_obj
+{
+  int operator()(int a, int b)
+  {
+    return a + b;
   }
 };
 
-template <class Sig, class F>
-memoizer<Sig, std::decay_t<F>> memoize(F &&f) { return {wrap{}, std::forward<F>(f)}; }
+struct poly_func_obj
+{
+  int operator()(double, double)
+  {
+    return 0;
+  }
+  int operator()(int a, int b)
+  {
+    return a + b;
+  }
+};
 
+using namespace memo;
 int main()
 {
-  // auto memoizedFunnyThing = MemoizeG<double(int, double)>(funnyThing);
-  // cout << memoizedFunnyThing(1, 1.1) << endl;
-  // memoizedFunnyThing(2, 1.1);
-  // memoizedFunnyThing(3, 1.1);
-  // memoizedFunnyThing(1, 1.1);
+  // auto memo = memoize(func);
+  // cout << memo(1, 2) << endl;
 
-  // auto convenientMemoizedFunnyThing = MakeMemoizeG(funnyThing);
+  // auto fib = memoize<size_t(size_t)>([](auto &fib, size_t n) -> size_t {
+  //   switch (n)
+  //   {
+  //   case 0:
+  //     return 0;
+  //   case 1:
+  //     return 1;
+  //   default:
+  //     return fib(n - 1) + fib(n - 2);
+  //   }
+  // });
+  // fib(10);
+  auto eigen = memoize([](const Vector3d &v) {
+    return v;
+  });
+  Vector3d v;
+  v << 1, 2, 3;
+  cout << eigen(v);
 
-  // convenientMemoizedFunnyThing(1, 1.1);
-  // convenientMemoizedFunnyThing(1, 1.1);
-
-  auto func = [](VectorXd &a) {
-    return a.norm();
-  };
-  auto memo_lambda = memoizer(func);
-  // auto memo_lambda = MakeMemoizeG(func);
   return 0;
 }
